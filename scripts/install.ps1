@@ -1,8 +1,8 @@
-# Sindarin Tensor Libraries Installer for Windows
-# Downloads and extracts the latest sindarin-pkg-tensor libs to .\libs\windows
+# Sindarin Net QUIC Libraries Installer for Windows
+# Downloads and extracts the latest sindarin-pkg-net-quic libs to .\libs\windows
 
 $ErrorActionPreference = "Stop"
-$REPO = "SindarinSDK/sindarin-pkg-tensor"
+$REPO = "SindarinSDK/sindarin-pkg-net-quic"
 $BASE_DIR = Join-Path $PSScriptRoot ".." "libs"
 $PLATFORM = "windows"
 $INSTALL_DIR = Join-Path $BASE_DIR $PLATFORM
@@ -29,8 +29,8 @@ function Get-LatestRelease {
 }
 
 try {
-    Write-Host "Sindarin Tensor Libraries Installer" -ForegroundColor Cyan
-    Write-Host "====================================" -ForegroundColor Cyan
+    Write-Host "Sindarin Net QUIC Libraries Installer" -ForegroundColor Cyan
+    Write-Host "======================================" -ForegroundColor Cyan
 
     $arch = Get-Architecture
     Write-Host "Detected: windows ($arch)" -ForegroundColor Cyan
@@ -44,7 +44,7 @@ try {
     if (Test-Path $cached) {
         Write-Host "Using cached $($release.Name)" -ForegroundColor Cyan
     } else {
-        Write-Host "Downloading sindarin-tensor $($release.Version)..." -ForegroundColor Cyan
+        Write-Host "Downloading sindarin-net-quic $($release.Version)..." -ForegroundColor Cyan
         Invoke-WebRequest -Uri $release.Url -OutFile $cached
     }
 
