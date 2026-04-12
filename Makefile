@@ -36,6 +36,29 @@ TEST_SRCS := $(wildcard tests/test_*.sn)
 TEST_BINS := $(patsubst tests/%.sn,$(BIN_DIR)/%$(EXE_EXT),$(TEST_SRCS))
 
 #------------------------------------------------------------------------------
+# Library installation (auto-downloads native libs if not present)
+#------------------------------------------------------------------------------
+install-libs: libs/$(PLATFORM)
+
+libs/$(PLATFORM):
+ifeq ($(OS),Windows_NT)
+	@powershell -ExecutionPolicy Bypass -File scripts/install.ps1
+else
+	@bash scripts/install.sh
+endif
+
+#------------------------------------------------------------------------------
+# Test runner (compiled from sindarin-pkg-test)
+#------------------------------------------------------------------------------
+RUN_TESTS_SN  := .sn/sindarin-pkg-test/src/execute.sn
+RUN_TESTS_BIN := $(BIN_DIR)/run_tests$(EXE_EXT)
+
+$(RUN_TESTS_BIN): $(RUN_TESTS_SN) $(SRC_SOURCES) | $(BIN_DIR) install-libs
+	@SN_CFLAGS="-I$(CURDIR)/libs/$(PLATFORM)/include $(SN_CFLAGS)" \
+	 SN_LDFLAGS="-L$(CURDIR)/libs/$(PLATFORM)/lib $(SN_LDFLAGS)" \
+	 $(SN) $(RUN_TESTS_SN) -o $@ -l 1
+
+#------------------------------------------------------------------------------
 # Targets
 #------------------------------------------------------------------------------
 all: test
@@ -44,29 +67,17 @@ all: test
 # --parallel 8: cap parallelism to avoid scheduler starvation under QUIC timing
 # --run-timeout 120: QUIC resilience tests need headroom under CI contention
 test: hooks $(RUN_TESTS_BIN)
-	@$(RUN_TESTS_BIN) --exclude test_persistent_rpc_burst --parallel 8 --run-timeout 120 --verbose
+	@SN_CFLAGS="-I$(CURDIR)/libs/$(PLATFORM)/include $(SN_CFLAGS)" \
+	 SN_LDFLAGS="-L$(CURDIR)/libs/$(PLATFORM)/lib $(SN_LDFLAGS)" \
+	 $(RUN_TESTS_BIN) --exclude test_persistent_rpc_burst --parallel 8 --run-timeout 120 --verbose
 
 $(BIN_DIR):
 	@$(MKDIR) $(BIN_DIR)
 
-$(BIN_DIR)/%$(EXE_EXT): tests/%.sn $(SRC_SOURCES) | $(BIN_DIR)
+$(BIN_DIR)/%$(EXE_EXT): tests/%.sn $(SRC_SOURCES) | $(BIN_DIR) install-libs
 	@SN_CFLAGS="-I$(CURDIR)/libs/$(PLATFORM)/include $(SN_CFLAGS)" \
 	 SN_LDFLAGS="-L$(CURDIR)/libs/$(PLATFORM)/lib $(SN_LDFLAGS)" \
 	 $(SN) $< -o $@ -l 1
-
-#------------------------------------------------------------------------------
-# Test runner (compiled from sindarin-pkg-test)
-#------------------------------------------------------------------------------
-RUN_TESTS_SRC := $(wildcard .sn/sindarin-pkg-test/src/run_tests.sn)
-RUN_TESTS_BIN := $(BIN_DIR)/run_tests$(EXE_EXT)
-
-$(RUN_TESTS_BIN): $(RUN_TESTS_SRC) | $(BIN_DIR)
-	@SN_CFLAGS="-I$(CURDIR)/libs/$(PLATFORM)/include $(SN_CFLAGS)" \
-	 SN_LDFLAGS="-L$(CURDIR)/libs/$(PLATFORM)/lib $(SN_LDFLAGS)" \
-	 $(SN) .sn/sindarin-pkg-test/src/run_tests.sn -o $@ -l 1
-
-install-libs:
-	@bash scripts/install.sh
 
 clean:
 	@echo "Cleaning build artifacts..."

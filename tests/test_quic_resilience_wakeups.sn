@@ -22,7 +22,7 @@
 # each test says what it catches.
 # ==============================================================================
 
-import "sindarin-pkg-net-quic/src/quic"
+import "../src/quic"
 import "sindarin-pkg-sdk/src/net/tcp"
 import "sindarin-pkg-sdk/src/time/time"
 

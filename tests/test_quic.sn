@@ -5,7 +5,7 @@
 # Self-contained: starts a listener, connects a client, tests streams.
 # ==============================================================================
 
-import "sindarin-pkg-net-quic/src/quic"
+import "../src/quic"
 import "sindarin-pkg-sdk/src/time/time"
 
 # Helper for test_sequential_stream_reopen: server-side stream acceptor
