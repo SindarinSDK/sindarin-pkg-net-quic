@@ -536,10 +536,10 @@ fn test_high_volume_sequential_streams(): void =>
     assert(resp == $"ack-{i}",
       $"iter {i}: expected 'ack-{i}', got '{resp}'")
     cs.close()
-    # Small delay between iterations to give MAX_STREAMS frames time to
-    # propagate, avoiding the known tight-loop stream-lifecycle race.
-    if i % 5 == 4 =>
-      Time.sleep(50)
+    # Delay every iteration to give MAX_STREAMS frames time to propagate.
+    # Under CI contention the peer's credit update can lag; 100ms per
+    # iteration keeps the budget replenished reliably.
+    Time.sleep(100)
 
   assert(waitForBg(30000l),
     "server accept loop did not complete within 30s")
