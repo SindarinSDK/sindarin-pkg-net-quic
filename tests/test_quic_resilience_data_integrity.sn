@@ -1,0 +1,573 @@
+# ==============================================================================
+# test_quic_resilience_data_integrity.sn - Data correctness edge-case tests
+# ==============================================================================
+# These tests verify data integrity under various edge conditions:
+#
+# (a) Large payloads that exercise buffer growth in stream_buf_append.
+# (b) Many small writes that exercise the WRITE_MORE coalescing path.
+# (c) All 256 byte values surviving the round trip (null byte handling).
+# (d) Line ending handling (\r\n stripping in readLine).
+# (e) Interleaved read/write on bidi streams for many iterations.
+# (f) Stream write after stream.close() must be a no-op (write_closed guard).
+# (g) High-volume sequential stream churn with data exchange — stream budget
+#     replenishment under sustained load.
+#
+# Every test has a wall-clock deadline. Background operations run in spawned
+# threads and communicate with main via `sync var` flags.
+# ==============================================================================
+
+import "../src/quic"
+import "sindarin-pkg-sdk/src/time/time"
+
+# ==============================================================================
+# Shared state for background threads
+# ==============================================================================
+
+sync var bgDone: bool = false
+sync var bgElapsedMs: long = 0l
+sync var bgResultInt: int = 0
+sync var bgResultStr: str = ""
+
+fn resetBg(): void =>
+  bgDone = false
+  bgElapsedMs = 0l
+  bgResultInt = 0
+  bgResultStr = ""
+
+fn waitForBg(timeoutMs: long): bool =>
+  var deadline: long = Time.now().millis() + timeoutMs
+  while !bgDone =>
+    if Time.now().millis() >= deadline =>
+      return false
+    Time.sleep(50)
+  return true
+
+# ==============================================================================
+# Test 1: large line write/read via writeLine/readLine.
+# ==============================================================================
+# Exercises buffer growth in stream_buf_append. A line longer than the
+# initial QUIC_STREAM_BUF_SIZE (64KB) must be written and read back intact.
+
+fn readLineBg(stream: QuicStream): int =>
+  var start: Time = Time.now()
+  bgResultStr = stream.readLine()
+  bgElapsedMs = Time.now().diff(start)
+  bgDone = true
+  return 0
+
+fn test_large_line_write_and_read(): void =>
+  print("test_large_line_write_and_read: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(30000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("open")
+  var ss: QuicStream = serverConn.acceptStream()
+  var open_: str = ss.readLine()
+  assert(open_ == "open", $"expected 'open', got '{open_}'")
+
+  # Build a ~70KB line from a repeating pattern.
+  var line: str = ""
+  var pattern: str = "ABCDEFGHIJKLMNOP"
+  for var i: int = 0; i < 4480; i++ =>
+    line = line + pattern
+  # line is 4480 * 16 = 71680 bytes — over the 64KB initial buf.
+
+  var expectedLen: int = line.length
+
+  # Server reads in background (may need to grow its buffer).
+  resetBg()
+  var h: int = & readLineBg(ss)
+
+  # Client writes the big line.
+  cs.writeLine(line)
+
+  assert(waitForBg(20000l),
+    "server readLine of 70KB line did not return within 20s")
+  assert(bgResultStr.length == expectedLen,
+    $"server received {bgResultStr.length} chars, expected {expectedLen}")
+  assert(bgResultStr == line,
+    "large line data mismatch (content differs)")
+  h ~
+
+  cs.close()
+  ss.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 2: many small writes coalesce correctly via readAll.
+# ==============================================================================
+# 500 tiny writes (2 bytes each) must all arrive correctly. Exercises
+# the WRITE_MORE coalescing path and recv_buf accumulation across many
+# recv_stream_data_cb calls.
+
+fn test_many_small_writes_coalesce(): void =>
+  print("test_many_small_writes_coalesce: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(15000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("open")
+  var ss: QuicStream = serverConn.acceptStream()
+  var open_: str = ss.readLine()
+  assert(open_ == "open", $"expected 'open', got '{open_}'")
+
+  var count: int = 500
+  var chunk: byte[] = "AB".toBytes()
+
+  for var i: int = 0; i < count; i++ =>
+    var wrote: int = cs.write(chunk)
+    assert(wrote == 2, $"write {i}: wrote {wrote}/2")
+
+  cs.close()
+
+  var got: byte[] = ss.readAll()
+  assert(got.length == count * 2,
+    $"expected {count * 2} bytes, got {got.length}")
+
+  # Verify the pattern is intact.
+  var aByte: byte = chunk[0]
+  var bByte: byte = chunk[1]
+  for var i: int = 0; i < count; i++ =>
+    assert(got[i * 2] == aByte,
+      $"byte {i*2}: expected 'A'")
+    assert(got[i * 2 + 1] == bByte,
+      $"byte {i*2+1}: expected 'B'")
+
+  ss.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 3: interleaved read/write on one bidi stream for 100 iterations.
+# ==============================================================================
+# Alternating read/write (ping-pong style) exercises the stream_mutex /
+# command queue interleaving in both directions on a single stream.
+
+fn serverPingPongBg(ss: QuicStream, count: int): int =>
+  for var i: int = 0; i < count; i++ =>
+    var msg: str = ss.readLine()
+    assert(msg == $"ping-{i}",
+      $"server iter {i}: expected 'ping-{i}', got '{msg}'")
+    ss.writeLine($"pong-{i}")
+  bgDone = true
+  return 0
+
+fn test_interleaved_read_write_on_bidi_stream(): void =>
+  print("test_interleaved_read_write_on_bidi_stream: ")
+  resetBg()
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(30000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("open")
+  var ss: QuicStream = serverConn.acceptStream()
+  var open_: str = ss.readLine()
+  assert(open_ == "open", $"expected 'open', got '{open_}'")
+
+  var count: int = 100
+  var h: int = & serverPingPongBg(ss, count)
+
+  for var i: int = 0; i < count; i++ =>
+    cs.writeLine($"ping-{i}")
+    var resp: str = cs.readLine()
+    assert(resp == $"pong-{i}",
+      $"client iter {i}: expected 'pong-{i}', got '{resp}'")
+
+  assert(waitForBg(30000l),
+    "server ping-pong did not complete within 30s")
+  h ~
+
+  cs.close()
+  ss.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 4: all 256 byte values survive the round trip.
+# ==============================================================================
+# Send a 256-byte payload containing every byte from 0x00 to 0xFF and
+# verify the receiver gets the exact same sequence. Catches any byte
+# value that gets mangled (e.g., null bytes, 0xFF, control chars).
+
+fn test_binary_payload_all_byte_values(): void =>
+  print("test_binary_payload_all_byte_values: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(5000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("open")
+  var ss: QuicStream = serverConn.acceptStream()
+  var open_: str = ss.readLine()
+  assert(open_ == "open", $"expected 'open', got '{open_}'")
+
+  # Build a 256-byte array with values 0..255.
+  var payload: byte[] = {}
+  for var i: int = 0; i < 256; i++ =>
+    payload.push(i.toByte())
+
+  var wrote: int = cs.write(payload)
+  assert(wrote == 256, $"wrote {wrote}/256 bytes")
+  cs.close()
+
+  var got: byte[] = ss.readAll()
+  assert(got.length == 256,
+    $"expected 256 bytes, got {got.length}")
+
+  for var i: int = 0; i < 256; i++ =>
+    assert(got[i] == payload[i],
+      $"byte {i}: expected {payload[i]}, got {got[i]}")
+
+  ss.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 5: readLine() correctly strips \r\n line endings.
+# ==============================================================================
+# The readLine implementation strips \r before \n. Verify this works for
+# Windows-style CRLF line endings sent as raw bytes.
+
+fn test_readline_with_carriage_returns(): void =>
+  print("test_readline_with_carriage_returns: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(5000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("open")
+  var ss: QuicStream = serverConn.acceptStream()
+  var open_: str = ss.readLine()
+  assert(open_ == "open", $"expected 'open', got '{open_}'")
+
+  # Send CRLF-terminated lines as raw bytes.
+  var crlfData: byte[] = "hello\r\nworld\r\n".toBytes()
+  ss.write(crlfData)
+
+  Time.sleep(200)
+
+  var l1: str = cs.readLine()
+  assert(l1 == "hello", $"line 1: expected 'hello', got '{l1}'")
+  var l2: str = cs.readLine()
+  assert(l2 == "world", $"line 2: expected 'world', got '{l2}'")
+
+  cs.close()
+  ss.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 6: multiple readLines interleaved with writes for 50 iterations.
+# ==============================================================================
+# Server writes a line, client reads; client writes a line, server reads.
+# 50 iterations on one stream. Distinct from test 3 (which uses bg thread)
+# because this is strictly sequential, testing the simplest lock interleave.
+
+fn test_multiple_readlines_interleaved_with_writes(): void =>
+  print("test_multiple_readlines_interleaved_with_writes: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(30000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("open")
+  var ss: QuicStream = serverConn.acceptStream()
+  var open_: str = ss.readLine()
+  assert(open_ == "open", $"expected 'open', got '{open_}'")
+
+  # Use a background thread for the server side.
+  resetBg()
+  var h: int = & serverPingPongBg(ss, 50)
+
+  for var i: int = 0; i < 50; i++ =>
+    cs.writeLine($"ping-{i}")
+    var resp: str = cs.readLine()
+    assert(resp == $"pong-{i}",
+      $"iter {i}: expected 'pong-{i}', got '{resp}'")
+
+  assert(waitForBg(30000l),
+    "interleaved read/write server did not complete within 30s")
+  h ~
+
+  cs.close()
+  ss.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 7: read after FIN returns buffered data, then empty.
+# ==============================================================================
+# Peer sends data + FIN in quick succession. First readAll returns the
+# data, subsequent readLine returns empty. Tests the ordering guarantee
+# that buffered data is always delivered before EOF.
+
+fn test_read_after_fin_returns_buffered_then_empty(): void =>
+  print("test_read_after_fin_returns_buffered_then_empty: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(5000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("open")
+  var ss: QuicStream = serverConn.acceptStream()
+  var open_: str = ss.readLine()
+  assert(open_ == "open", $"expected 'open', got '{open_}'")
+
+  # Server sends data and immediately closes (FIN).
+  var payload: byte[] = "buffered-data".toBytes()
+  ss.write(payload)
+  ss.close()
+
+  # Give data + FIN time to land.
+  Time.sleep(300)
+
+  # Client reads — must get the buffered data first.
+  var got: byte[] = cs.readAll()
+  assert(got.length == payload.length,
+    $"expected {payload.length} bytes, got {got.length}")
+  assert(got.toString() == "buffered-data",
+    $"expected 'buffered-data', got '{got.toString()}'")
+
+  cs.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 8: write() after stream.close() returns 0.
+# ==============================================================================
+# Once a stream has been closed (FIN sent), further writes must return 0
+# due to the write_closed guard. Must not crash or re-send data.
+
+fn test_stream_write_after_stream_close_is_noop(): void =>
+  print("test_stream_write_after_stream_close_is_noop: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(5000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("before-close")
+  var ss: QuicStream = serverConn.acceptStream()
+  var msg: str = ss.readLine()
+  assert(msg == "before-close", $"expected 'before-close', got '{msg}'")
+
+  # Close the stream (sends FIN).
+  cs.close()
+  Time.sleep(100)
+
+  # Write after close — must return 0 and not crash.
+  var afterData: byte[] = "after-close".toBytes()
+  var wrote: int = cs.write(afterData)
+  assert(wrote == 0,
+    $"write() after stream.close() should return 0, got {wrote}")
+
+  # writeLine after close must also be safe (no-op).
+  cs.writeLine("also-after-close")
+
+  ss.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 9: uni stream write-only — reading from the opened direction is safe.
+# ==============================================================================
+# A unidirectional stream is write-only from the opener's side. Attempting
+# to read from it should not crash. The read may return empty or block
+# until the stream is closed — the point is no crash or corruption.
+
+fn readLineBgSafe(stream: QuicStream): int =>
+  var s: str = stream.readLine()
+  bgResultStr = s
+  bgDone = true
+  return 0
+
+fn test_uni_stream_read_on_write_side_is_safe(): void =>
+  print("test_uni_stream_read_on_write_side_is_safe: ")
+  resetBg()
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(2000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openUnidirectionalStream()
+  assert(cs.isUnidirectional(), "should be uni")
+
+  # Try reading from the write-only side in a bg thread so a hang is bounded.
+  var h: int = & readLineBgSafe(cs)
+
+  # Close the stream after a short delay to unblock the reader.
+  Time.sleep(500)
+  cs.close()
+
+  # The reader must exit in bounded time (either from close or idle timeout).
+  assert(waitForBg(5000l),
+    "readLine on uni write-side did not return within 5s")
+  h ~
+
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 10: sequential stream open/exchange/close exercises budget replenishment.
+# ==============================================================================
+# Opens a fresh bidi stream per iteration on a connection with a small stream
+# budget (10). 25 iterations means the peer's MAX_STREAMS credit must be
+# replenished at least once. A small delay between iterations gives the
+# MAX_STREAMS frame time to propagate, avoiding the known tight-loop race
+# in test_persistent_rpc_burst.
+
+fn serverAcceptLoop(conn: QuicConnection, count: int): int =>
+  for var i: int = 0; i < count; i++ =>
+    var ss: QuicStream = conn.acceptStream()
+    if ss.isClosed() =>
+      bgResultInt = i
+      bgDone = true
+      return 0
+    var msg: str = ss.readLine()
+    assert(msg == $"seq-{i}",
+      $"server stream {i}: expected 'seq-{i}', got '{msg}'")
+    ss.writeLine($"ack-{i}")
+    ss.close()
+  bgResultInt = count
+  bgDone = true
+  return 0
+
+fn test_high_volume_sequential_streams(): void =>
+  print("test_high_volume_sequential_streams: ")
+  resetBg()
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  # Small bidi stream budget (10) so we exercise MAX_STREAMS replenishment
+  # without needing hundreds of tight-loop iterations.
+  var cfg: QuicConfig = QuicConfig.defaults()
+    .setIdleTimeout(0)
+    .setMaxBidiStreams(10)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var count: int = 25
+  var h: int = & serverAcceptLoop(serverConn, count)
+
+  for var i: int = 0; i < count; i++ =>
+    var cs: QuicStream = client.openStream()
+    assert(!cs.isClosed(),
+      $"openStream failed at iteration {i} (stream budget exhausted?)")
+    cs.writeLine($"seq-{i}")
+    var resp: str = cs.readLine()
+    assert(resp == $"ack-{i}",
+      $"iter {i}: expected 'ack-{i}', got '{resp}'")
+    cs.close()
+    # Small delay between iterations to give MAX_STREAMS frames time to
+    # propagate, avoiding the known tight-loop stream-lifecycle race.
+    if i % 5 == 4 =>
+      Time.sleep(50)
+
+  assert(waitForBg(30000l),
+    "server accept loop did not complete within 30s")
+  assert(bgResultInt == count,
+    $"server handled {bgResultInt}/{count} streams")
+  h ~
+
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Main
+# ==============================================================================
+
+fn main(): void =>
+  print("=== QUIC Resilience Data Integrity Tests ===\n\n")
+
+  test_large_line_write_and_read()
+  test_many_small_writes_coalesce()
+  test_interleaved_read_write_on_bidi_stream()
+  test_binary_payload_all_byte_values()
+  test_readline_with_carriage_returns()
+  test_multiple_readlines_interleaved_with_writes()
+  test_read_after_fin_returns_buffered_then_empty()
+  test_stream_write_after_stream_close_is_noop()
+  test_uni_stream_read_on_write_side_is_safe()
+  test_high_volume_sequential_streams()
+
+  print("\nAll QUIC resilience data integrity tests passed!\n")

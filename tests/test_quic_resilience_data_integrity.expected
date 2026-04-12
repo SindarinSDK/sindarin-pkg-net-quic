@@ -1,0 +1,14 @@
+=== QUIC Resilience Data Integrity Tests ===
+
+test_large_line_write_and_read: PASS
+test_many_small_writes_coalesce: PASS
+test_interleaved_read_write_on_bidi_stream: PASS
+test_binary_payload_all_byte_values: PASS
+test_readline_with_carriage_returns: PASS
+test_multiple_readlines_interleaved_with_writes: PASS
+test_read_after_fin_returns_buffered_then_empty: PASS
+test_stream_write_after_stream_close_is_noop: PASS
+test_uni_stream_read_on_write_side_is_safe: PASS
+test_high_volume_sequential_streams: PASS
+
+All QUIC resilience data integrity tests passed!

@@ -1,0 +1,593 @@
+# ==============================================================================
+# test_quic_resilience_concurrency.sn - Concurrency & multi-connection tests
+# ==============================================================================
+# These tests exercise the QUIC stack under concurrent workloads:
+#
+# (a) Multiple streams doing I/O in parallel on one connection — stresses
+#     the per-stream mutex, command queue, and I/O thread scheduling.
+# (b) Multiple clients connected to one listener simultaneously — stresses
+#     listener routing, sweep, and per-connection isolation.
+# (c) 0-RTT resumption token round trip — the connectEarly path is untested
+#     elsewhere and involves a distinct SSL session restore + ngtcp2 setup.
+# (d) The serve() handler API — never tested, exercises the acceptStream
+#     loop + background thread spawn per stream.
+# (e) Post-close getter safety and data delivery edge cases.
+#
+# Every test has a wall-clock deadline. Background operations run in spawned
+# threads and communicate with main via `sync var` flags.
+# ==============================================================================
+
+import "../src/quic"
+import "sindarin-pkg-sdk/src/time/time"
+
+# ==============================================================================
+# Shared state for background threads
+# ==============================================================================
+
+sync var bgDone: bool = false
+sync var bgElapsedMs: long = 0l
+sync var bgResultInt: int = 0
+sync var bgResultStr: str = ""
+
+sync var bg2Done: bool = false
+sync var bg2ResultStr: str = ""
+
+fn resetBg(): void =>
+  bgDone = false
+  bgElapsedMs = 0l
+  bgResultInt = 0
+  bgResultStr = ""
+  bg2Done = false
+  bg2ResultStr = ""
+
+fn waitForBg(timeoutMs: long): bool =>
+  var deadline: long = Time.now().millis() + timeoutMs
+  while !bgDone =>
+    if Time.now().millis() >= deadline =>
+      return false
+    Time.sleep(50)
+  return true
+
+# ==============================================================================
+# Test 1: N bidi streams doing request/response in parallel on one connection.
+# ==============================================================================
+# Exercises the per-stream mutex, command queue, and I/O thread scheduling
+# under real contention. Each of N streams is driven by its own background
+# thread doing a writeLine + readLine round trip. All must complete within
+# a bounded wall-clock window without deadlocking or corrupting each other's
+# data.
+
+sync var parallelDoneCount: int = 0
+
+fn parallelStreamWorker(conn: QuicConnection, idx: int): int =>
+  var cs: QuicStream = conn.openStream()
+  if cs.isClosed() =>
+    parallelDoneCount = parallelDoneCount + 1
+    return 0
+  cs.writeLine($"req-{idx}")
+  var resp: str = cs.readLine()
+  assert(resp == $"echo-req-{idx}",
+    $"parallel stream {idx}: expected 'echo-req-{idx}', got '{resp}'")
+  cs.close()
+  parallelDoneCount = parallelDoneCount + 1
+  return 0
+
+fn serverEchoLoop(conn: QuicConnection, count: int): int =>
+  for var i: int = 0; i < count; i++ =>
+    var ss: QuicStream = conn.acceptStream()
+    if ss.isClosed() =>
+      return i
+    var msg: str = ss.readLine()
+    ss.writeLine($"echo-{msg}")
+    ss.close()
+  return count
+
+fn test_concurrent_bidirectional_streams(): void =>
+  print("test_concurrent_bidirectional_streams: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(15000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var count: int = 10
+  parallelDoneCount = 0
+
+  # Server echo loop in background.
+  var sh: int = & serverEchoLoop(serverConn, count)
+  sh ~
+
+  # Spawn N client workers in parallel.
+  for var i: int = 0; i < count; i++ =>
+    var h: int = & parallelStreamWorker(client, i)
+    h ~
+
+  # Wait for all workers to finish.
+  var deadline: long = Time.now().millis() + 15000l
+  while parallelDoneCount < count =>
+    if Time.now().millis() >= deadline =>
+      assert(false,
+        $"only {parallelDoneCount}/{count} parallel streams completed within 15s")
+    Time.sleep(50)
+
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 2: Multiple clients connected to one listener, all exchanging data.
+# ==============================================================================
+# Stresses listener routing + sweep + per-connection isolation. Each of N
+# clients connects, does a stream exchange, and disconnects. All N are
+# connected simultaneously before any disconnects. A routing bug or
+# cross-connection state corruption would deliver the wrong data.
+
+fn test_concurrent_connections_on_one_listener(): void =>
+  print("test_concurrent_connections_on_one_listener: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(10000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+
+  var count: int = 5
+  var clients: QuicConnection[] = {}
+  var serverConns: QuicConnection[] = {}
+
+  # Connect all clients simultaneously.
+  for var i: int = 0; i < count; i++ =>
+    var c: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+    assert(!c.isClosed(), $"client {i} failed to connect")
+    clients.push(c)
+    var sc: QuicConnection = server.accept()
+    assert(!sc.isClosed(), $"server accept {i} returned closed")
+    serverConns.push(sc)
+
+  # Each client opens a stream and sends a unique message.
+  for var i: int = 0; i < count; i++ =>
+    var cs: QuicStream = clients[i].openStream()
+    cs.writeLine($"client-{i}-hello")
+    var ss: QuicStream = serverConns[i].acceptStream()
+    var msg: str = ss.readLine()
+    assert(msg == $"client-{i}-hello",
+      $"conn {i}: expected 'client-{i}-hello', got '{msg}'")
+    ss.writeLine($"server-{i}-ack")
+    var ack: str = cs.readLine()
+    assert(ack == $"server-{i}-ack",
+      $"conn {i}: expected 'server-{i}-ack', got '{ack}'")
+    cs.close()
+    ss.close()
+
+  # Tear down in reverse order to exercise sweep under varied teardown ordering.
+  for var i: int = count - 1; i >= 0; i-- =>
+    clients[i].close()
+    serverConns[i].close()
+
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 3: read(N) must return at most N bytes.
+# ==============================================================================
+# The bounded read contract: a caller that passes N for maxBytes must get
+# at most N bytes back, never the whole recv_buf. This matters for protocols
+# that frame fixed-size headers.
+
+fn test_read_returns_at_most_max_bytes(): void =>
+  print("test_read_returns_at_most_max_bytes: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(5000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  # Send 100 bytes.
+  var payload: str = ""
+  for var i: int = 0; i < 10; i++ =>
+    payload = payload + "0123456789"
+  cs.write(payload.toBytes())
+  cs.close()
+
+  var ss: QuicStream = serverConn.acceptStream()
+  # Give the data time to arrive.
+  Time.sleep(200)
+
+  # Read with maxBytes=32 — must return <= 32 bytes.
+  var got: byte[] = ss.read(32)
+  assert(got.length > 0, "read(32) should return some data")
+  assert(got.length <= 32,
+    $"read(32) returned {got.length} bytes, expected <= 32")
+
+  # Read the rest.
+  var rest: byte[] = ss.readAll()
+  var total: int = got.length + rest.length
+  assert(total == 100,
+    $"total bytes received: {total}, expected 100")
+
+  ss.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 4: readExact(N) must return exactly N bytes when enough data exists.
+# ==============================================================================
+# The exact read contract: if more bytes are available than requested, the
+# call must return exactly N, not more.
+
+fn test_read_exact_returns_exact_bytes(): void =>
+  print("test_read_exact_returns_exact_bytes: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(5000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  # Send 100 bytes.
+  var payload: str = ""
+  for var i: int = 0; i < 10; i++ =>
+    payload = payload + "ABCDEFGHIJ"
+  cs.write(payload.toBytes())
+  cs.close()
+
+  var ss: QuicStream = serverConn.acceptStream()
+  # Give the data time to arrive.
+  Time.sleep(200)
+
+  # readExact(25) must return exactly 25 bytes.
+  var first: byte[] = ss.readExact(25)
+  assert(first.length == 25,
+    $"readExact(25) returned {first.length} bytes, expected 25")
+
+  # readExact(75) must return exactly 75 bytes.
+  var second: byte[] = ss.readExact(75)
+  assert(second.length == 75,
+    $"readExact(75) returned {second.length} bytes, expected 75")
+
+  ss.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 5: write() pounding while peer dies mid-flight.
+# ==============================================================================
+# A writer thread spinning on write() while the connection is abruptly
+# dropped must exit in bounded time. It must not deadlock on the command
+# queue, and it must not use-after-free on the write_bufs list.
+
+sync var writerDone: bool = false
+
+fn writerLoopBg(stream: QuicStream): int =>
+  var chunk: byte[] = "XXXXXXXXXX".toBytes()
+  var total: int = 0
+  for var i: int = 0; i < 5000; i++ =>
+    var wrote: int = stream.write(chunk)
+    if wrote == 0 =>
+      writerDone = true
+      return 0
+    total = total + wrote
+  writerDone = true
+  return 0
+
+fn test_write_during_peer_abrupt_drop(): void =>
+  print("test_write_during_peer_abrupt_drop: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(600)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("start")
+  var ss: QuicStream = serverConn.acceptStream()
+  var start_: str = ss.readLine()
+  assert(start_ == "start", $"expected 'start', got '{start_}'")
+
+  writerDone = false
+  var h: int = & writerLoopBg(cs)
+
+  # Let the writer get going.
+  Time.sleep(100)
+
+  # Drop the server socket abruptly.
+  serverConn.quicTestDropSocket()
+
+  # The writer must finish within a bounded window (idle timeout + slack).
+  var deadline: long = Time.now().millis() + 5000l
+  while !writerDone =>
+    if Time.now().millis() >= deadline =>
+      assert(false, "writer did not exit within 5s of abrupt peer drop")
+    Time.sleep(50)
+  h ~
+
+  ss.close()
+  serverConn.close()
+  server.close()
+  cs.close()
+  client.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 6: 0-RTT resumption token round trip.
+# ==============================================================================
+# Get a resumption token from the first connection, then use connectEarly()
+# with that token for a second connection. The second connection must
+# succeed and exchange data normally.
+
+fn test_resumption_token_round_trip(): void =>
+  print("test_resumption_token_round_trip: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(5000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+
+  # First connection: establish, exchange, get token.
+  var c1: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var s1: QuicConnection = server.accept()
+
+  var cs1: QuicStream = c1.openStream()
+  cs1.writeLine("first-conn")
+  var ss1: QuicStream = s1.acceptStream()
+  var m1: str = ss1.readLine()
+  assert(m1 == "first-conn", $"first conn: expected 'first-conn', got '{m1}'")
+
+  # Give OpenSSL time to produce the session ticket.
+  Time.sleep(200)
+
+  var token: byte[] = c1.resumptionToken()
+  # Token may be empty if the server didn't send a ticket yet — that's OK,
+  # connectEarly falls back to a normal connect. We just verify it doesn't crash.
+  cs1.close()
+  ss1.close()
+  c1.close()
+  s1.close()
+
+  # Second connection: use the token for 0-RTT (or fallback).
+  var c2: QuicConnection = QuicConnection.connectEarly($"127.0.0.1:{port}", token)
+  assert(!c2.isClosed(), "connectEarly should return a live connection")
+
+  var s2: QuicConnection = server.accept()
+  var cs2: QuicStream = c2.openStream()
+  cs2.writeLine("early-conn")
+  var ss2: QuicStream = s2.acceptStream()
+  var m2: str = ss2.readLine()
+  assert(m2 == "early-conn", $"early conn: expected 'early-conn', got '{m2}'")
+
+  cs2.close()
+  ss2.close()
+  c2.close()
+  s2.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 7: serve() handler receives multiple streams.
+# ==============================================================================
+# The serve() API has zero test coverage. It spawns a background thread per
+# accepted stream and calls the handler. We send 5 streams to a server using
+# serve() and verify all handlers fire and can exchange data.
+
+sync var serveCount: int = 0
+
+fn echoHandler(stream: QuicStream): int =>
+  var msg: str = stream.readLine()
+  stream.writeLine($"served-{msg}")
+  stream.close()
+  serveCount = serveCount + 1
+  return 0
+
+fn serverServe(conn: QuicConnection): int =>
+  conn.serve(echoHandler)
+  return 0
+
+fn test_serve_handler_receives_multiple_streams(): void =>
+  print("test_serve_handler_receives_multiple_streams: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(10000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  serveCount = 0
+  var sh: int = & serverServe(serverConn)
+  sh ~
+
+  var count: int = 5
+  for var i: int = 0; i < count; i++ =>
+    var cs: QuicStream = client.openStream()
+    cs.writeLine($"msg-{i}")
+    var resp: str = cs.readLine()
+    assert(resp == $"served-msg-{i}",
+      $"stream {i}: expected 'served-msg-{i}', got '{resp}'")
+    cs.close()
+
+  # Give serve handlers time to finish.
+  Time.sleep(300)
+
+  assert(serveCount == count,
+    $"serve handler fired {serveCount} times, expected {count}")
+
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 8: remoteAddress() on a closed/dead connection is safe.
+# ==============================================================================
+# Long-lived code that logs the remote address of a connection may hold a
+# handle whose underlying state has already been torn down. Must return a
+# valid (possibly empty) string, not crash.
+
+fn test_remote_address_after_close_is_safe(): void =>
+  print("test_remote_address_after_close_is_safe: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(0)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  # Verify it works while alive.
+  var addr: str = serverConn.remoteAddress()
+  assert(addr.startsWith("127.0.0.1:"),
+    $"live remoteAddress should start with 127.0.0.1:, got '{addr}'")
+
+  # Close everything, then call remoteAddress on the dead handles.
+  client.close()
+  serverConn.close()
+  server.close()
+
+  Time.sleep(200)
+
+  # Must not crash — may return the cached string or empty.
+  var deadAddr: str = serverConn.remoteAddress()
+  var clientAddr: str = client.remoteAddress()
+  # Just assert they're strings (no crash).
+  assert(deadAddr.length >= 0, "remoteAddress on closed serverConn must not crash")
+  assert(clientAddr.length >= 0, "remoteAddress on closed client must not crash")
+
+  print("PASS\n")
+
+# ==============================================================================
+# Test 9: buffered data is still readable after stream FIN arrives.
+# ==============================================================================
+# Server writes data then closes the stream. Client reads after the FIN
+# has propagated. The buffered data must still be delivered before the
+# empty-EOF signal.
+
+fn test_stream_close_then_read_returns_buffered_data(): void =>
+  print("test_stream_close_then_read_returns_buffered_data: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(5000)
+
+  var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
+  var port: int = server.port()
+  var client: QuicConnection = QuicConnection.connectWith($"127.0.0.1:{port}", cfg)
+  var serverConn: QuicConnection = server.accept()
+
+  # Client opens stream, server accepts.
+  var cs: QuicStream = client.openStream()
+  cs.writeLine("open")
+  var ss: QuicStream = serverConn.acceptStream()
+  var open_: str = ss.readLine()
+  assert(open_ == "open", $"expected 'open', got '{open_}'")
+
+  # Server writes 3 lines and closes the stream.
+  ss.writeLine("line-1")
+  ss.writeLine("line-2")
+  ss.writeLine("line-3")
+  ss.close()
+
+  # Give the data + FIN time to propagate.
+  Time.sleep(300)
+
+  # Client reads — all 3 lines must be delivered despite FIN already received.
+  var l1: str = cs.readLine()
+  assert(l1 == "line-1", $"line 1: expected 'line-1', got '{l1}'")
+  var l2: str = cs.readLine()
+  assert(l2 == "line-2", $"line 2: expected 'line-2', got '{l2}'")
+  var l3: str = cs.readLine()
+  assert(l3 == "line-3", $"line 3: expected 'line-3', got '{l3}'")
+
+  # After the buffered data, the next read should return empty (EOF).
+  var eof: str = cs.readLine()
+  assert(eof == "", $"after buffered data, readLine should return empty, got '{eof}'")
+
+  cs.close()
+  client.close()
+  serverConn.close()
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Test 10: 50 cycles of connect/stream-exchange/close on one listener.
+# ==============================================================================
+# The existing connection_churn test in test_quic.sn does 200 cycles but
+# no stream I/O. This test does 50 cycles with an actual data exchange per
+# cycle, exercising the full lifecycle (connect, handshake, open stream,
+# write, read, close stream, close conn) repeatedly.
+
+fn test_connection_churn_with_streams(): void =>
+  print("test_connection_churn_with_streams: ")
+
+  var cert_path: str = "tests/test_quic_cert.pem"
+  var key_path: str = "tests/test_quic_key.pem"
+
+  var server: QuicListener = QuicListener.bind(":0", cert_path, key_path)
+  var port: int = server.port()
+
+  for var i: int = 0; i < 50; i++ =>
+    var client: QuicConnection = QuicConnection.connect($"127.0.0.1:{port}")
+    var sc: QuicConnection = server.accept()
+
+    var cs: QuicStream = client.openStream()
+    cs.writeLine($"cycle-{i}")
+    var ss: QuicStream = sc.acceptStream()
+    var msg: str = ss.readLine()
+    assert(msg == $"cycle-{i}",
+      $"cycle {i}: expected 'cycle-{i}', got '{msg}'")
+
+    cs.close()
+    ss.close()
+    client.close()
+    sc.close()
+
+  server.close()
+  print("PASS\n")
+
+# ==============================================================================
+# Main
+# ==============================================================================
+
+fn main(): void =>
+  print("=== QUIC Resilience Concurrency Tests ===\n\n")
+
+  test_concurrent_bidirectional_streams()
+  test_concurrent_connections_on_one_listener()
+  test_read_returns_at_most_max_bytes()
+  test_read_exact_returns_exact_bytes()
+  test_write_during_peer_abrupt_drop()
+  test_resumption_token_round_trip()
+  test_serve_handler_receives_multiple_streams()
+  test_remote_address_after_close_is_safe()
+  test_stream_close_then_read_returns_buffered_data()
+  test_connection_churn_with_streams()
+
+  print("\nAll QUIC resilience concurrency tests passed!\n")
