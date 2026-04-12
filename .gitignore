@@ -1,0 +1,9 @@
+.sn/
+build/
+libs/
+bin/
+*.exe
+
+# Claude Code per-project config (hooks, settings, MCP servers)
+.claude/
+.mcp.json
