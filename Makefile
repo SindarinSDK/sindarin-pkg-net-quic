@@ -63,13 +63,12 @@ $(RUN_TESTS_BIN): $(RUN_TESTS_SN) $(SRC_SOURCES) | $(BIN_DIR) install-libs
 #------------------------------------------------------------------------------
 all: test
 
-# --exclude test_persistent_rpc_burst: known flake (stream-lifecycle race)
 # --parallel 8: cap parallelism to avoid scheduler starvation under QUIC timing
 # --run-timeout 120: QUIC resilience tests need headroom under CI contention
 test: hooks $(RUN_TESTS_BIN)
 	@SN_CFLAGS="-I$(CURDIR)/libs/$(PLATFORM)/include $(SN_CFLAGS)" \
 	 SN_LDFLAGS="-L$(CURDIR)/libs/$(PLATFORM)/lib $(SN_LDFLAGS)" \
-	 $(RUN_TESTS_BIN) --exclude test_persistent_rpc_burst --parallel 8 --run-timeout 120 --verbose
+	 $(RUN_TESTS_BIN) --parallel 8 --run-timeout 120 --verbose
 
 $(BIN_DIR):
 	@$(MKDIR) $(BIN_DIR)

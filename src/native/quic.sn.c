@@ -348,6 +348,7 @@ typedef struct QuicCommand {
     uint8_t *data;
     size_t data_len;
     int64_t result_stream_id;
+    void *result_stream_ptr;   /* retained RtQuicStream* — avoids post-wait scan race */
     char *migrate_address;
     int result_code;
     size_t bytes_written;
@@ -1344,7 +1345,12 @@ static void quic_execute_cmd(RtQuicConnection *conn, QuicCommand *cmd) {
         for (;;) {
             rv = ngtcp2_conn_open_bidi_stream(ci->qconn, &stream_id, NULL);
             if (rv == 0) {
-                quic_find_or_create_stream(conn, stream_id);
+                RtQuicStream *s = quic_find_or_create_stream(conn, stream_id);
+                /* Retain for the caller now, while we're still on the I/O
+                 * thread and ci->streams[] can't be mutated under us.
+                 * The user thread picks this up after quic_cmd_complete
+                 * without scanning ci->streams[]. */
+                if (s) cmd->result_stream_ptr = __sn__QuicStream_retain(s);
                 break;
             }
             if (rv != NGTCP2_ERR_STREAM_ID_BLOCKED) break;
@@ -1415,6 +1421,7 @@ static void quic_execute_cmd(RtQuicConnection *conn, QuicCommand *cmd) {
                 if (s) {
                     QuicStreamInternal *si = stream_internal(s);
                     si->is_uni = true;
+                    cmd->result_stream_ptr = __sn__QuicStream_retain(s);
                 }
                 break;
             }
@@ -3027,14 +3034,13 @@ __sn__QuicStream *sn_quic_connection_open_stream(__sn__QuicConnection *conn) {
 
     QUIC_STRM_DBG("open_stream: opened conn=%p stream_id=%" PRId64, (void*)ci, (int64_t)cmd.result_stream_id);
 
-    /* Stream was already created by the I/O thread — just look it up.
-     * Retain before returning so Sindarin gets its own reference. */
-    for (int i = 0; i < ci->stream_count; i++) {
-        if (ci->streams[i] && ci->streams[i]->stream_id == cmd.result_stream_id) {
-            return (__sn__QuicStream *)__sn__QuicStream_retain(ci->streams[i]);
-        }
-    }
-    return NULL;
+    /* The I/O thread retained the stream before completing the command,
+     * so we can return it directly — no scan of ci->streams[] needed.
+     * This avoids a race where stream_close_cb (running on the I/O
+     * thread for a *different* stream) could swap-remove our freshly
+     * created entry from ci->streams[] between quic_cmd_complete and
+     * the scan that used to happen here. */
+    return (__sn__QuicStream *)cmd.result_stream_ptr;
 }
 
 __sn__QuicStream *sn_quic_connection_open_uni_stream(__sn__QuicConnection *conn) {
@@ -3053,12 +3059,7 @@ __sn__QuicStream *sn_quic_connection_open_uni_stream(__sn__QuicConnection *conn)
         return NULL;
     }
 
-    for (int i = 0; i < ci->stream_count; i++) {
-        if (ci->streams[i] && ci->streams[i]->stream_id == cmd.result_stream_id) {
-            return (__sn__QuicStream *)__sn__QuicStream_retain(ci->streams[i]);
-        }
-    }
-    return NULL;
+    return (__sn__QuicStream *)cmd.result_stream_ptr;
 }
 
 __sn__QuicStream *sn_quic_connection_accept_stream(__sn__QuicConnection *conn) {
