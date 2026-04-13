@@ -317,6 +317,7 @@ typedef struct QuicStreamInternal {
     bool closed;
     bool write_closed;
     bool is_uni;
+    uint64_t write_offset;  /* cumulative bytes written — stamps write_bufs */
 } QuicStreamInternal;
 
 /* Routed packet: listener pushes to per-connection ring, I/O thread drains */
@@ -402,10 +403,19 @@ static QuicCommand *cmd_queue_pop(QuicCmdQueue *q) {
     return cmd;
 }
 
-/* Write buffer list node — holds a copy of data passed to stream_write.
- * ngtcp2 retains internal references for WRITE_MORE and retransmission. */
+/* Write buffer node — holds a copy of data passed to stream_write.
+ *
+ * ngtcp2 retains pointers to stream data vectors for coalescing
+ * (WRITE_MORE) and retransmission until the peer acknowledges receipt.
+ * Each buffer is tagged with its stream_id and the byte offset at
+ * which it ends, so the acked_stream_data_offset callback can free
+ * exactly the buffers whose data has been acknowledged.  On stream
+ * close, all remaining buffers for that stream are freed (ngtcp2
+ * guarantees it won't touch them after stream_close_cb). */
 typedef struct QuicWriteBuf {
     uint8_t *data;
+    int64_t stream_id;
+    uint64_t end_offset;   /* stream byte offset AFTER this buffer's data */
     struct QuicWriteBuf *next;
 } QuicWriteBuf;
 
@@ -463,9 +473,8 @@ typedef struct QuicConnectionInternal {
     int cached_scid_count;
     /* Command queue: app threads push, I/O thread drains */
     QuicCmdQueue cmd_queue;
-    /* Write buffer list: copies of data passed to sn_quic_stream_write.
-       ngtcp2 retains internal references to write data for coalescing and
-       retransmission.  Copies are freed when the connection closes. */
+    /* Write buffers awaiting ACK — freed by acked_stream_data_offset_cb
+       or stream_close_cb. Protected by write_bufs_mutex. */
     struct QuicWriteBuf *write_bufs;
     mutex_t write_bufs_mutex;
     /* Wakeup mechanism for client I/O thread (eventfd/pipe) */
@@ -776,6 +785,38 @@ static int quic_stream_open_cb(ngtcp2_conn *conn, int64_t stream_id, void *user_
     return 0;
 }
 
+/* Free write buffers for |stream_id| whose end_offset <= |acked_up_to|.
+ * Pass UINT64_MAX to free ALL buffers for the stream (used on stream close). */
+static void quic_free_acked_write_bufs(QuicConnectionInternal *ci,
+                                        int64_t stream_id, uint64_t acked_up_to)
+{
+    MUTEX_LOCK(&ci->write_bufs_mutex);
+    QuicWriteBuf **pp = &ci->write_bufs;
+    while (*pp) {
+        QuicWriteBuf *wb = *pp;
+        if (wb->stream_id == stream_id && wb->end_offset <= acked_up_to) {
+            *pp = wb->next;
+            free(wb->data);
+            free(wb);
+        } else {
+            pp = &wb->next;
+        }
+    }
+    MUTEX_UNLOCK(&ci->write_bufs_mutex);
+}
+
+static int quic_acked_stream_data_offset_cb(ngtcp2_conn *conn, int64_t stream_id,
+                                             uint64_t offset, uint64_t datalen,
+                                             void *user_data, void *stream_user_data)
+{
+    (void)conn;
+    (void)stream_user_data;
+    RtQuicConnection *qc = (RtQuicConnection *)user_data;
+    QuicConnectionInternal *ci = conn_internal(qc);
+    quic_free_acked_write_bufs(ci, stream_id, offset + datalen);
+    return 0;
+}
+
 static int quic_stream_close_cb(ngtcp2_conn *qconn, uint32_t flags,
                                  int64_t stream_id, uint64_t app_error_code,
                                  void *user_data, void *stream_user_data) {
@@ -787,6 +828,10 @@ static int quic_stream_close_cb(ngtcp2_conn *qconn, uint32_t flags,
 
     QUIC_STRM_DBG("close_cb: fire conn=%p stream_id=%" PRId64 " is_server=%d flags=0x%x",
                   (void*)qci, (int64_t)stream_id, qci->is_server ? 1 : 0, flags);
+
+    /* ngtcp2 guarantees it won't touch this stream's data after this
+     * callback — free all remaining write buffers for the stream. */
+    quic_free_acked_write_bufs(qci, stream_id, UINT64_MAX);
 
     /* Canonical final-close site. Mark the stream fully closed AND remove
      * it from qci->streams[]. This is the only place the array shrinks
@@ -1575,7 +1620,8 @@ static void quic_io_thread_cleanup(RtQuicConnection *conn) {
         }
     }
 
-    /* Free all write buffer copies — ngtcp2 no longer needs them */
+    /* Free any remaining write buffers — connection is closing, ngtcp2
+       won't touch stream data any more. */
     MUTEX_LOCK(&ci->write_bufs_mutex);
     QuicWriteBuf *wb = ci->write_bufs;
     ci->write_bufs = NULL;
@@ -1931,6 +1977,7 @@ static RtQuicConnection *quic_connection_create(char *address,
     callbacks.recv_stream_data = quic_recv_stream_data_cb;
     callbacks.stream_open = quic_stream_open_cb;
     callbacks.stream_close = quic_stream_close_cb;
+    callbacks.acked_stream_data_offset = quic_acked_stream_data_offset_cb;
     callbacks.handshake_completed = quic_handshake_completed_cb;
     callbacks.rand = quic_rand_cb;
     callbacks.get_new_connection_id = quic_get_new_connection_id_cb;
@@ -2100,7 +2147,7 @@ static RtQuicConnection *quic_server_connection_create(socket_t sock,
     COND_INIT(&ci->handshake_cond);
     COND_INIT(&ci->accept_stream_cond);
 
-    /* Initialize command queue and write buffer list (server — wakeup via pkt_ring_cond) */
+    /* Initialize command queue and write buffer list (server) */
     cmd_queue_init(&ci->cmd_queue);
     ci->write_bufs = NULL;
     MUTEX_INIT(&ci->write_bufs_mutex);
@@ -2136,6 +2183,7 @@ static RtQuicConnection *quic_server_connection_create(socket_t sock,
     callbacks.recv_stream_data = quic_recv_stream_data_cb;
     callbacks.stream_open = quic_stream_open_cb;
     callbacks.stream_close = quic_stream_close_cb;
+    callbacks.acked_stream_data_offset = quic_acked_stream_data_offset_cb;
     callbacks.handshake_completed = quic_handshake_completed_cb;
     callbacks.rand = quic_rand_cb;
     callbacks.get_new_connection_id = quic_get_new_connection_id_cb;
@@ -2782,15 +2830,17 @@ long long sn_quic_stream_write(__sn__QuicStream *stream, SnArray *data) {
     QuicConnectionInternal *ci = conn_internal(conn);
     if (ci->closed || si->write_closed) return 0;
 
-    /* Copy the data — ngtcp2 retains internal references to stream data
-       for WRITE_MORE coalescing and retransmission across IO thread iterations.
-       The copy is freed when the connection closes. */
+    /* Copy the data — ngtcp2 retains pointers for retransmission.
+       Freed by acked_stream_data_offset_cb or stream_close_cb. */
     uint8_t *data_copy = (uint8_t *)malloc(data_len);
     if (!data_copy) return 0;
     memcpy(data_copy, data->data, data_len);
 
+    uint64_t end_off = si->write_offset + data_len;
     QuicWriteBuf *wb = (QuicWriteBuf *)malloc(sizeof(QuicWriteBuf));
     wb->data = data_copy;
+    wb->stream_id = _stream->stream_id;
+    wb->end_offset = end_off;
     MUTEX_LOCK(&ci->write_bufs_mutex);
     wb->next = ci->write_bufs;
     ci->write_bufs = wb;
@@ -2804,6 +2854,7 @@ long long sn_quic_stream_write(__sn__QuicStream *stream, SnArray *data) {
     cmd.data_len = data_len;
 
     quic_submit_cmd_and_wait(ci, &cmd);
+    si->write_offset = end_off;
     return (long long)cmd.bytes_written;
 }
 
@@ -2820,18 +2871,17 @@ void sn_quic_stream_write_line(__sn__QuicStream *stream, char *text) {
     size_t text_len = strlen(text);
     size_t total_len = text_len + 1;
 
-    /* Register the payload in ci->write_bufs so it lives until the connection
-       closes. ngtcp2 retains internal references to stream data for WRITE_MORE
-       coalescing and retransmission, so freeing immediately after submit races
-       with the I/O thread's next flush. Matches sn_quic_stream_write. */
     uint8_t *buf = (uint8_t *)malloc(total_len);
     if (!buf) return;
     memcpy(buf, text, text_len);
     buf[text_len] = '\n';
 
+    uint64_t end_off = si->write_offset + total_len;
     QuicWriteBuf *wb = (QuicWriteBuf *)malloc(sizeof(QuicWriteBuf));
     if (!wb) { free(buf); return; }
     wb->data = buf;
+    wb->stream_id = _stream->stream_id;
+    wb->end_offset = end_off;
     MUTEX_LOCK(&ci->write_bufs_mutex);
     wb->next = ci->write_bufs;
     ci->write_bufs = wb;
@@ -2845,6 +2895,7 @@ void sn_quic_stream_write_line(__sn__QuicStream *stream, char *text) {
     cmd.data_len = total_len;
 
     quic_submit_cmd_and_wait(ci, &cmd);
+    si->write_offset = end_off;
 }
 
 long long sn_quic_stream_get_id(__sn__QuicStream *stream) {
