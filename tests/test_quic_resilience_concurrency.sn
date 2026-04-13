@@ -4,13 +4,13 @@
 # These tests exercise the QUIC stack under concurrent workloads:
 #
 # (a) Multiple streams doing I/O in parallel on one connection — stresses
-#     the per-stream mutex, command queue, and I/O thread scheduling.
+# the per-stream mutex, command queue, and I/O thread scheduling.
 # (b) Multiple clients connected to one listener simultaneously — stresses
-#     listener routing, sweep, and per-connection isolation.
+# listener routing, sweep, and per-connection isolation.
 # (c) 0-RTT resumption token round trip — the connectEarly path is untested
-#     elsewhere and involves a distinct SSL session restore + ngtcp2 setup.
+# elsewhere and involves a distinct SSL session restore + ngtcp2 setup.
 # (d) The serve() handler API — never tested, exercises the acceptStream
-#     loop + background thread spawn per stream.
+# loop + background thread spawn per stream.
 # (e) Post-close getter safety and data delivery edge cases.
 #
 # Every test has a wall-clock deadline. Background operations run in spawned

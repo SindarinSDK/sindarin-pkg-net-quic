@@ -10,7 +10,7 @@
 # (e) Interleaved read/write on bidi streams for many iterations.
 # (f) Stream write after stream.close() must be a no-op (write_closed guard).
 # (g) High-volume sequential stream churn with data exchange — stream budget
-#     replenishment under sustained load.
+# replenishment under sustained load.
 #
 # Every test has a wall-clock deadline. Background operations run in spawned
 # threads and communicate with main via `sync var` flags.
