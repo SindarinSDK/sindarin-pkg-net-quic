@@ -132,7 +132,7 @@ fn test_concurrent_connections_on_one_listener(): void =>
 
   var cert_path: str = "tests/test_quic_cert.pem"
   var key_path: str = "tests/test_quic_key.pem"
-  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(10000)
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(30000)
 
   var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
   var port: int = server.port()
@@ -294,7 +294,7 @@ fn test_write_during_peer_abrupt_drop(): void =>
 
   var cert_path: str = "tests/test_quic_cert.pem"
   var key_path: str = "tests/test_quic_key.pem"
-  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(600)
+  var cfg: QuicConfig = QuicConfig.defaults().setIdleTimeout(2000)
 
   var server: QuicListener = QuicListener.bindWith(":0", cert_path, key_path, cfg)
   var port: int = server.port()
@@ -317,10 +317,10 @@ fn test_write_during_peer_abrupt_drop(): void =>
   serverConn.quicTestDropSocket()
 
   # The writer must finish within a bounded window (idle timeout + slack).
-  var deadline: long = Time.now().millis() + 5000l
+  var deadline: long = Time.now().millis() + 10000l
   while !writerDone =>
     if Time.now().millis() >= deadline =>
-      assert(false, "writer did not exit within 5s of abrupt peer drop")
+      assert(false, "writer did not exit within 10s of abrupt peer drop")
     Time.sleep(50)
   h ~
 

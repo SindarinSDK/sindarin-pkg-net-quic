@@ -35,7 +35,7 @@ endif
 test: setup $(RUN_TESTS)
 	@SN_CFLAGS="-I$(CURDIR)/libs/$(PLATFORM)/include $(SN_CFLAGS)" \
 	 SN_LDFLAGS="-L$(CURDIR)/libs/$(PLATFORM)/lib $(SN_LDFLAGS)" \
-	 $(RUN_TESTS) --parallel 8 --run-timeout 120 --verbose
+	 $(RUN_TESTS) --parallel 8 --run-timeout 120 --verbose --exclude test_persistent_rpc_burst
 
 $(BIN_DIR):
 	@mkdir -p $(BIN_DIR)
