@@ -402,11 +402,12 @@ static QuicCommand *cmd_queue_pop(QuicCmdQueue *q) {
     return cmd;
 }
 
-/* (QuicWriteBuf removed — ngtcp2_conn_writev_stream copies stream data
- * into its own internal buffers during the call. The data vectors only
- * need to be valid for the duration of that call. Since
- * quic_submit_cmd_and_wait is synchronous, the caller's data_copy can
- * be freed immediately after the command completes.) */
+/* Write buffer list node — holds a copy of data passed to stream_write.
+ * ngtcp2 retains internal references for WRITE_MORE and retransmission. */
+typedef struct QuicWriteBuf {
+    uint8_t *data;
+    struct QuicWriteBuf *next;
+} QuicWriteBuf;
 
 /* QuicConnection: Sindarin exposes conn_ptr and socket_fd only */
 typedef __sn__QuicConnection RtQuicConnection;
@@ -462,7 +463,11 @@ typedef struct QuicConnectionInternal {
     int cached_scid_count;
     /* Command queue: app threads push, I/O thread drains */
     QuicCmdQueue cmd_queue;
-    /* (write_bufs removed — data copies freed immediately after write) */
+    /* Write buffer list: copies of data passed to sn_quic_stream_write.
+       ngtcp2 retains internal references to write data for coalescing and
+       retransmission.  Copies are freed when the connection closes. */
+    struct QuicWriteBuf *write_bufs;
+    mutex_t write_bufs_mutex;
     /* Wakeup mechanism for client I/O thread (eventfd/pipe) */
     int wakeup_fd;
     int wakeup_write_fd;
@@ -1570,6 +1575,19 @@ static void quic_io_thread_cleanup(RtQuicConnection *conn) {
         }
     }
 
+    /* Free all write buffer copies — ngtcp2 no longer needs them */
+    MUTEX_LOCK(&ci->write_bufs_mutex);
+    QuicWriteBuf *wb = ci->write_bufs;
+    ci->write_bufs = NULL;
+    MUTEX_UNLOCK(&ci->write_bufs_mutex);
+    while (wb) {
+        QuicWriteBuf *next = wb->next;
+        free(wb->data);
+        free(wb);
+        wb = next;
+    }
+    MUTEX_DESTROY(&ci->write_bufs_mutex);
+
     QUIC_IO_DBG("cleanup: drained pending commands, woke %d streams",
                 ci->stream_count);
 }
@@ -1874,8 +1892,10 @@ static RtQuicConnection *quic_connection_create(char *address,
     COND_INIT(&ci->handshake_cond);
     COND_INIT(&ci->accept_stream_cond);
 
-    /* Initialize command queue and wakeup mechanism (client) */
+    /* Initialize command queue, write buffer list, and wakeup mechanism (client) */
     cmd_queue_init(&ci->cmd_queue);
+    ci->write_bufs = NULL;
+    MUTEX_INIT(&ci->write_bufs_mutex);
     ci->wakeup_fd = -1;
     ci->wakeup_write_fd = -1;
     wakeup_create(&ci->wakeup_fd, &ci->wakeup_write_fd);
@@ -2080,8 +2100,10 @@ static RtQuicConnection *quic_server_connection_create(socket_t sock,
     COND_INIT(&ci->handshake_cond);
     COND_INIT(&ci->accept_stream_cond);
 
-    /* Initialize command queue (server — wakeup via pkt_ring_cond) */
+    /* Initialize command queue and write buffer list (server — wakeup via pkt_ring_cond) */
     cmd_queue_init(&ci->cmd_queue);
+    ci->write_bufs = NULL;
+    MUTEX_INIT(&ci->write_bufs_mutex);
     ci->wakeup_fd = -1;
     ci->wakeup_write_fd = -1;
 
@@ -2760,12 +2782,19 @@ long long sn_quic_stream_write(__sn__QuicStream *stream, SnArray *data) {
     QuicConnectionInternal *ci = conn_internal(conn);
     if (ci->closed || si->write_closed) return 0;
 
-    /* Copy the data — quic_submit_cmd_and_wait is synchronous, so the
-       copy only needs to live until the command completes. ngtcp2 copies
-       stream data into its own internal buffers during writev_stream. */
+    /* Copy the data — ngtcp2 retains internal references to stream data
+       for WRITE_MORE coalescing and retransmission across IO thread iterations.
+       The copy is freed when the connection closes. */
     uint8_t *data_copy = (uint8_t *)malloc(data_len);
     if (!data_copy) return 0;
     memcpy(data_copy, data->data, data_len);
+
+    QuicWriteBuf *wb = (QuicWriteBuf *)malloc(sizeof(QuicWriteBuf));
+    wb->data = data_copy;
+    MUTEX_LOCK(&ci->write_bufs_mutex);
+    wb->next = ci->write_bufs;
+    ci->write_bufs = wb;
+    MUTEX_UNLOCK(&ci->write_bufs_mutex);
 
     QuicCommand cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -2775,9 +2804,7 @@ long long sn_quic_stream_write(__sn__QuicStream *stream, SnArray *data) {
     cmd.data_len = data_len;
 
     quic_submit_cmd_and_wait(ci, &cmd);
-    long long written = (long long)cmd.bytes_written;
-    free(data_copy);
-    return written;
+    return (long long)cmd.bytes_written;
 }
 
 void sn_quic_stream_write_line(__sn__QuicStream *stream, char *text) {
@@ -2793,10 +2820,22 @@ void sn_quic_stream_write_line(__sn__QuicStream *stream, char *text) {
     size_t text_len = strlen(text);
     size_t total_len = text_len + 1;
 
+    /* Register the payload in ci->write_bufs so it lives until the connection
+       closes. ngtcp2 retains internal references to stream data for WRITE_MORE
+       coalescing and retransmission, so freeing immediately after submit races
+       with the I/O thread's next flush. Matches sn_quic_stream_write. */
     uint8_t *buf = (uint8_t *)malloc(total_len);
     if (!buf) return;
     memcpy(buf, text, text_len);
     buf[text_len] = '\n';
+
+    QuicWriteBuf *wb = (QuicWriteBuf *)malloc(sizeof(QuicWriteBuf));
+    if (!wb) { free(buf); return; }
+    wb->data = buf;
+    MUTEX_LOCK(&ci->write_bufs_mutex);
+    wb->next = ci->write_bufs;
+    ci->write_bufs = wb;
+    MUTEX_UNLOCK(&ci->write_bufs_mutex);
 
     QuicCommand cmd;
     memset(&cmd, 0, sizeof(cmd));
@@ -2806,7 +2845,6 @@ void sn_quic_stream_write_line(__sn__QuicStream *stream, char *text) {
     cmd.data_len = total_len;
 
     quic_submit_cmd_and_wait(ci, &cmd);
-    free(buf);
 }
 
 long long sn_quic_stream_get_id(__sn__QuicStream *stream) {
