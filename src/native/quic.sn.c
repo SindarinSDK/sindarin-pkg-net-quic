@@ -2081,7 +2081,12 @@ static RtQuicConnection *quic_connection_create(char *address,
         }
     }
 
-    /* Start I/O thread */
+    /* Start I/O thread. The I/O thread is the sole owner of all ngtcp2 calls
+     * on this connection; its first loop iteration will issue the initial
+     * flush (sending the client hello). Do NOT kick a flush from this thread
+     * as well — quic_flush_tx is lock-free, and a concurrent writev_stream
+     * from two threads in NGTCP2_CS_CLIENT_INITIAL invokes client_initial_cb
+     * twice, which asserts in ngtcp2_conn_set_retry_aead. */
     ci->io_running = true;
 
 #ifdef _WIN32
@@ -2090,11 +2095,6 @@ static RtQuicConnection *quic_connection_create(char *address,
 #else
     pthread_create(&ci->io_thread, NULL, quic_io_thread_entry, conn);
 #endif
-
-    /* Perform initial flush to send client hello */
-    MUTEX_LOCK(&ci->conn_mutex);
-    quic_flush_tx(conn);
-    MUTEX_UNLOCK(&ci->conn_mutex);
 
     /* Wait for handshake to complete */
     MUTEX_LOCK(&ci->conn_mutex);
