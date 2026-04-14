@@ -2081,12 +2081,18 @@ static RtQuicConnection *quic_connection_create(char *address,
         }
     }
 
-    /* Start I/O thread. The I/O thread is the sole owner of all ngtcp2 calls
-     * on this connection; its first loop iteration will issue the initial
-     * flush (sending the client hello). Do NOT kick a flush from this thread
-     * as well — quic_flush_tx is lock-free, and a concurrent writev_stream
-     * from two threads in NGTCP2_CS_CLIENT_INITIAL invokes client_initial_cb
-     * twice, which asserts in ngtcp2_conn_set_retry_aead. */
+    /* Perform the initial flush (sends client hello) BEFORE spawning the
+     * I/O thread. quic_flush_tx is lock-free, so doing it here keeps
+     * ngtcp2 single-threaded while the conn is in NGTCP2_CS_CLIENT_INITIAL:
+     * if the I/O thread and this thread both entered writev_stream at that
+     * state, client_initial_cb would be invoked twice and ngtcp2 would
+     * assert in ngtcp2_conn_set_retry_aead (observed on macOS as SIGABRT).
+     * Flushing first also arms the ngtcp2 expiry timer, so the I/O thread's
+     * first poll returns promptly instead of waiting the capped 1000 ms. */
+    quic_flush_tx(conn);
+
+    /* Now start the I/O thread. From here on, it is the sole owner of all
+     * ngtcp2 calls on this connection (app writes go through the cmd queue). */
     ci->io_running = true;
 
 #ifdef _WIN32
